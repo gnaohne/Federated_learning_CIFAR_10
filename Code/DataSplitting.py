@@ -1,32 +1,31 @@
 import os
 import json
+import numpy as np
 import torch
 from torchvision import datasets, transforms
 from typing import Dict, List
 import random
 from PIL import Image
-
+from concurrent.futures import ThreadPoolExecutor
 class DataSplitting:
-    def __init__(self, data_dir: str, data_split_file: str):
+    def __init__(self, data_dir: str, data_split_file: str, report_file: str = None, data_extract_file: str = None):
         self.data_dir = data_dir
         self.data_split_file = data_split_file
+        self.report_file = report_file
+        self.data_extract_file = data_extract_file
 
         self.train_data = None
         self.clients = None
 
         self._load_data()
         self._load_data_split()
+        self._load_report()
+        self._load_data_extract_file()
 
     def _load_data(self):
         self.train_data = datasets.CIFAR10(root=self.data_dir, train=True, download=True)
-        # images_data, labels_data, self.labels = self.train_data.data, self.train_data.targets, self.train_data.classes
-        
-        # print(f"Training data size: {len(self.train_data)}")
-        # print(f"Image size: {self.train_data.data.shape}")
-        # print(f"Labels: {self.train_data.classes}")
 
     def _load_data_split(self):
-        # Load data split configuration from JSON file
         with open(self.data_split_file, 'r') as f:
             self.data_split = json.load(f)
 
@@ -43,14 +42,42 @@ class DataSplitting:
             label_clientname_list.append(clientname_lists)
         self.data_split['label_clientname_list'] = label_clientname_list
 
+    def _load_report(self):
+        if self.report_file == None:
+            return
+        with open(self.report_file, 'r') as f:
+            report = json.load(f)
+        self.clients = report['clients']
+        print(f"Report loaded successfully from {self.report_file}")
+        return report
+
+    def _load_data_extract_file(self):
+        if self.data_extract_file == None:
+            return None
+        self.train_features = np.load(self.data_extract_file, allow_pickle=True)
+        # cast to float32
+        self.train_features = self.train_features.astype('float32')
+        print(f"Load training data features from {self.data_extract_file}")
+        return self.train_features
+
+    def load_report(self, report_file: str):
+        with open(report_file, 'r') as f:
+            report = json.load(f)
+        self.clients = report['clients']
+        print(f"Report loaded successfully from {report_file}")
+        return report
+    def load_data_extract_file(self, data_extract_file: str):
+        self.data_extract_file = data_extract_file
+        return self._load_data_extract_file()
+
     def get_clients_names(self):
         return self.clients_name
 
     def create_clients(self, unique_data: bool = True):
         """
         Splits the data for each client based on the JSON configuration.
-        
-        args: 
+
+        args:
             - unique_data: If True, all clients get different data.
                             If False, clients can share the same data.
             - self.class_data: The training data with each class label.
@@ -58,8 +85,8 @@ class DataSplitting:
                 - n_clients: The number of clients.
                 - client_format: The format for client names.
                 - class_clients_list: A list of clients for each class.
-        
-        return: a dictionary with keys clients' names and value as 
+
+        return: a dictionary with keys clients' names and value as
                 data shards - tuple of images and label lists.
         """
         n_clients = self.data_split["n_clients"]
@@ -73,15 +100,16 @@ class DataSplitting:
             self._seperate_data_non_unique(self.train_data, self.clients)
 
         print(f"Data split successfully for {n_clients} clients.")
+        self.generate_report()
         return self.clients
 
     def _seperate_data_unique(self, train_data, clients):
         """
         Seperates the data for each client uniquely.
-        
+
         args:
             - clients: A dictionary containing the clients and their data.
-        
+
         return: A dictionary containing the clients and their data.
         """
         label_clientname_list = self.data_split['label_clientname_list']
@@ -95,10 +123,10 @@ class DataSplitting:
     def _seperate_data_non_unique(self, train_data, clients):
         """
         Seperates the data for each client non-uniquely.
-        
+
         args:
             - clients: A dictionary containing the clients and their data.
-        
+
         return: A dictionary containing the clients and their data.
         """
         label_clientname_list = self.data_split['label_clientname_list']
@@ -109,7 +137,7 @@ class DataSplitting:
                 if is_choose:
                     self.clients[client_name].append(idx)
         return self.clients
-            
+
 
     def _save_client_data_to_file(self):
         for client_name, data_indices in self.clients.items():
@@ -117,11 +145,11 @@ class DataSplitting:
             client_folder = os.path.join(self.data_dir, client_name)
             if not os.path.exists(client_folder):
                 os.makedirs(client_folder)
-            else: 
+            else:
                 # Clear previous data
                 for file_name in os.listdir(client_folder):
                     os.remove(os.path.join(client_folder, file_name))
-            
+
             for idx in data_indices:
                 image, label = self.train_data[idx]
                 image.save(os.path.join(client_folder, f"{idx}_{label}.PNG"))
@@ -132,7 +160,7 @@ class DataSplitting:
     def generate_report(self) -> Dict:
         """
         Generates a report of the data distribution for each client.
-        
+
         :return: A dictionary containing the number of samples for each client.
         """
         report = {client_name: {} for client_name in self.clients.keys()}
@@ -141,72 +169,99 @@ class DataSplitting:
             for label, class_name in enumerate(self.train_data.classes):
                 report[client_name][class_name] = sum([1 for idx in data_indices if self.train_data.targets[idx] == label])
 
+        report['clients'] = self.clients
         with open(os.path.join(self.data_dir, 'data_split_report.json'), 'w') as f:
             json.dump(report, f, indent=4)
+        print(f"Data split report generated successfully to file {os.path.join(self.data_dir, 'data_split_report.json')}")
         return report
 
-    def get_client_data(self, client_name: str):
+    def get_client_data(self, client_name: str) -> List[tuple]:
         """
         Retrieves the dataset for a specific client.
-        
+
         :param client_name: The name of the client.
         :return: A subset of the training data corresponding to the client's data.
         """
-        if self.clients == None:
+        if self.clients == None or client_name not in self.clients:
             return self.load_client_data(client_name)
-        else: 
+        else:
+            print(f"Get data for client: {client_name}")
             client_data = [self.train_data[idx] for idx in self.clients[client_name]]
             return client_data
+    def load_client_data_ids_labels(self, client_name: str):
+        """
+        Retrieves the dataset for a specific client from the saved files.
+
+        :param client_name: The name of the client.
+        :return: A subset of the training data corresponding to the client's data.
+        """
+        client_folder = os.path.join(self.data_dir, client_name)
+        print(f"Loading data_id for client: {client_name} at {client_folder}")
+        idxs = []
+        labels = []
+        for file_name in os.listdir(client_folder):
+            idx = int(file_name.split('_')[0])
+            label = int(file_name.split('_')[-1].split('.')[0])
+            idxs.append(idx)
+            labels.append(label)
+        self.clients[client_name] = idxs
+        return idxs, labels
     def load_client_data(self, client_name: str):
         """
         Retrieves the dataset for a specific client from the saved files.
-        
+
         :param client_name: The name of the client.
         :return: A subset of the training data corresponding to the client's data.
         """
         client_folder = os.path.join(self.data_dir, client_name)
         print(f"Loading data for client: {client_name} at {client_folder}")
         client_data = []
+        self.clients[client_name] = []
         for file_name in os.listdir(client_folder):
             # parse image to PIL.Image.Image format
             image = Image.open(os.path.join(client_folder, file_name))
             image = image.convert('RGB')
-        
+
+            idx = int(file_name.split('_')[0])
             label = int(file_name.split('_')[-1].split('.')[0])
+            self.clients[client_name].append(idx)
             client_data.append((image, label))
         return client_data
 
-    def get_clients_objects(self) -> List:
+    def get_clients_data(self) -> Dict[str, List[tuple]]:
+        """
+        Retrieves the data for all clients.
+
+        :return
+            clients: A dictionary containing the data for each client.
+        """
         clients = {}
 
-        if(self.clients == None):
-            for client in self.data_split['clients']:
-                client_name = client['name']
-                clients[client_name] = self.load_client_data(client_name)
-        else:
-            for client_name in self.clients.keys():
-                clients[client_name] = self.get_client_data(client_name)
+        for client_name in self.get_clients_names():
+            clients[client_name] = self.get_client_data(client_name)
         return clients
 
-def main():
-    lab_folder = './'
-    data_folder = os.path.join(lab_folder, 'data')
+    def get_client_data_extraction(self, client_name: str):
+        # Load the id of the data for the client
+        if self.data_extract_file == None:
+          print("Haven't load extract file")
+          return None
 
-    def create_if_not_exist(folder):
-        if not os.path.exists(folder):
-            os.makedirs(folder)
-    create_if_not_exist(data_folder)
+        print(f"Loading data extraction for client: {client_name}")
+        if self.clients != None and client_name in self.clients:
+            idxs = self.clients[client_name]
+            labels = [self.train_data.targets[idx] for idx in idxs]
+        else:
+            idxs, labels = self.load_client_data_ids_labels(client_name)
 
-    trainset = datasets.CIFAR10(root=data_folder, train=True, download=True)
-    testset = datasets.CIFAR10(root=data_folder, train=False, download=True)
-    classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-    nClasses  = 10
+        data_features = [self.train_features[idx] for idx in idxs]
+        client_data = []
+        for idx, (image, label) in enumerate(zip(data_features, labels)):
+            client_data.append((image, label))
+        return client_data
 
-    dataSplit = DataSplitting(data_folder, os.path.join(data_folder, 'data_split.json'))
-    dataSplit.create_clients(unique_data=True)
-    dataSplit._save_client_data_to_file()
-    dataSplit.generate_report()
-
-# Run this code if this file is run as a script
-if __name__ == "__main__":
-    main()
+    def get_clients_data_extraction(self):
+        clients = {}
+        for client_name in self.get_clients_names():
+            clients[client_name] = self.get_client_data_extraction(client_name)
+        return clients

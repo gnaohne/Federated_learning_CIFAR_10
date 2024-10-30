@@ -11,17 +11,13 @@ class CIFAR10(nn.Module):
         self.linear = nn.Linear(inputSize, numClasses)
         self.layers = [
             lambda xb: xb.reshape(-1, self.linear.in_features), # flatten the input
-            self.normalize,
-            self.linear, 
+            # self.normalize,
+            self.linear,
         ]
-    
-    def set_weights(self, weights):
-        if isinstance(weights, list):  # Convert list to tensor if needed
-            weights = torch.tensor(weights, dtype=self.linear.weight.data.dtype)
-        self.linear.weight.data = weights    
-    def get_weights(self):
-        return self.linear.weight.data
-        
+
+    def parameters(self):
+        return self.linear.parameters()
+
     def normalize(self, xb):
         mean = xb.mean(dim=0, keepdim=True)
         std = xb.std(dim=0, keepdim=True)
@@ -33,6 +29,20 @@ class CIFAR10(nn.Module):
             val = layer(val)
         return val
 
+    def state_dict(self):
+        return self.linear.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.linear.load_state_dict(state_dict)
+
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+        print(f"Model saved to {path}")
+
+    def load(self, path):
+        self.load_state_dict(torch.load(path))
+        print(f"Model loaded from {path}")
+
     def predict(self, xb):
         output = self.forward(xb)
         probs = F.softmax(output, dim=1)
@@ -42,13 +52,11 @@ class CIFAR10(nn.Module):
     @property
     def weight(self):
         return self.linear.weight
-    
+
     @property
     def bias(self):
         return self.linear.bias
-    
+
     @property
     def full_param(self):
         return self.linear.weight + self.linear.bias.unsqueeze(1)
-
-

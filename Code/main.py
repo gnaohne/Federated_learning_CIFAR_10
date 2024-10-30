@@ -1,11 +1,11 @@
 import os
+from time import time
 import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchvision
-from sklearn.preprocessing import LabelBinarizer
 from torch.utils.data.sampler import SubsetRandomSampler
 from torch.utils.data.dataloader import DataLoader
 import torch.nn.functional as F
@@ -30,25 +30,19 @@ testset = torchvision.datasets.CIFAR10(root=data_folder, train=False, download=T
 classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 nClasses  = 10
 
-def get_data_distribution(dataset):
-    dataSplit = DataSplitting(data_folder, os.path.join(data_folder, 'data_split.json'))
+def get_data_distribution(dataSplit):
     dataSplit.create_clients(unique_data=True)
     dataSplit._save_client_data_to_file()
     dataSplit.generate_report()
     return dataSplit
 
-def transform_to_tensor(imageRGB):
-    return  torch.tensor(np.array(imageRGB))
-
 def transform_data(data):
-    images, labels = zip(*data)
-    images, labels = list(images), list(labels)
-    images = [transform_to_tensor(image) for image in images]
-    images = [image.float() for image in images]  # convert to float
-
-    labels = torch.tensor(labels)  # Convert labels directly to tensor without one-hot encoding
-
-    return list(zip(images, labels))
+  transform = torchvision.transforms.Compose([
+    torchvision.transforms.ToTensor(),
+    torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+  ])
+  data = [(transform(image), label) for image, label in data]
+  return data
 
 batch_size = 32
 pCV = 0.1
@@ -111,101 +105,130 @@ def accuracy(outputs, labels):
   return torch.sum(preds == labels).item() / len(preds)
 
 def fit(epochs, model, lossFn, opt, trainDL, valDL, metric=None, patience=5):
-#   best_val_loss = float('inf')
-#   best_weights = model.state_dict()
-#   patience_counter = 0
+  best_val_loss = float('inf')
+  best_weights = model.state_dict()
+  patience_counter = 0
 
   valList = [0.10]
   for epoch in range(epochs):
     # training - perform one step gradient descent on each batch, then moves on
-    for xb, yb in trainDL: 
+    for xb, yb in trainDL:
       loss, _, lossMetric = lossBatch(model, lossFn, xb, yb, opt)
-      
 
-    # evaluation on cross val dataset - after updating over all batches, technically one epoch
-    # evaluates over all validation batches and then calculates average val loss, as well as the metric (accuracy)
-    valResult = evaluate(model, lossFn, valDL, metric)
-    valLoss, total, valMetric = valResult
-    valList.append(valMetric)
+    with torch.no_grad():  # Disable gradient calculation for validation
+        valResult = evaluate(model, lossFn, valDL, metric)
+        valLoss, total, valMetric = valResult
+        valList.append(valMetric)
 
-    # model.eval()  # Ensure model is in evaluation mode
-    # with torch.no_grad():  # Disable gradient calculation for validation
-    #     valResult = evaluate(model, lossFn, valDL, metric)
-    #     valLoss, total, valMetric = valResult
-    #     valList.append(valMetric)
+    # Check if the current epoch's validation loss is the best
+    if valLoss < best_val_loss:
+        best_val_loss = valLoss
+        best_weights = model.state_dict()  # Save the best model weights
+        patience_counter = 0  # Reset the patience counter
+    else:
+        patience_counter += 1  # Increment patience counter if no improvement
 
-    # # Check if the current epoch's validation loss is the best
-    # if valLoss < best_val_loss:
-    #     best_val_loss = valLoss
-    #     best_weights = model.state_dict()  # Save the best model weights
-    #     patience_counter = 0  # Reset the patience counter
-    # else:
-    #     patience_counter += 1  # Increment patience counter if no improvement
+    if patience_counter >= patience:
+        print(f"Early stopping at epoch {epoch + 1}")
+        model.load_state_dict(best_weights)  # Load the best weights
+        break
 
     # print progress
-    if metric is None: 
+    if metric is None:
       print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, epochs, valLoss))
     else:
       print('Epoch [{}/{}], Loss: {:.4f}, {}: {:.4f}'.format(epoch + 1, epochs, valLoss, metric.__name__, valMetric))
 
+  model.load_state_dict(best_weights)
   return valList
 
+
+def evaluate_with_dataset(model, datasetT, name="Data"):
+    X, y = zip(*datasetT)
+    X = np.array(X)
+    y = np.array(y)
+
+    y_pred = model.predict(torch.tensor(X, dtype=torch.float32))
+    print(f"{name} accuracy: %.3f" % accuracy_score(y, y_pred))
+    ConfusionMatrixDisplay.from_predictions(y, y_pred)
+    plt.show()
+
 epochs = 10
-def train_local_model(client_data, initWeights=None):
+def train_local_model(client_data, global_config):
     trainLoader, validLoader = prepare_data(client_data)
-    model = CIFAR10()
+    model = CIFAR10(global_config['inputShape'], global_config['outputShape'])
+    if global_config['state_dict'] :
+        model.load_state_dict(global_config['state_dict'])
+        model.to(torch.float32)
+
     dataLen = len(client_data)
 
-    if initWeights is not None:
-        model.set_weights(initWeights)
-    
     learningRate = 0.001
     optimizer = torch.optim.SGD(model.parameters(), lr=learningRate)
     metric = accuracy
     fit(epochs, model, lossFn, optimizer, trainLoader, validLoader, metric)
-    return model.get_weights(), dataLen
 
-def weight_scalling_factor(client_results):
-    # calculate the total data points across all clients
+    return model.state_dict(), dataLen
+
+def weight_scaling_factor(client_results):
+    # Calculate the total data points across all clients
     totalDataPoints = sum([client_results[client][1] for client in client_results])
-    # calculate the scaling factor
+    # Calculate the scaling factor for each client
     scaling_factor = {client: (client_results[client][1] / totalDataPoints) for client in client_results}
     return scaling_factor
 
-def sum_scaled_weights(scaled_weights):
-    # each weight is tensor [10, 3072]
-    avg_weight = list()
-    for weights_list_tuple in zip(*scaled_weights):
-        layer_mean = torch.stack(weights_list_tuple).mean(0)
-        avg_weight.append(layer_mean)
-    avg_weight = torch.stack(avg_weight)
-    return avg_weight
-    
-def scale_model_weights(client_results, scaling_factor):
-    scaled_weights = []
-    for client in scaling_factor:
-        weight = client_results[client][0]
-        scaled_weight = [scaling_factor[client] * w for w in weight]
-        scaled_weight = torch.stack(scaled_weight)
-        scaled_weights.append(scaled_weight)
-    return scaled_weights
+def scale_model_state_dict(state_dict, scale_factor):
+    scaled_state_dict = {}
+    for key in state_dict:
+        scaled_state_dict[key] = state_dict[key] * scale_factor
+    return scaled_state_dict
 
-def aggregate_model_weights(client_results):
-    scaling_factor = weight_scalling_factor(client_results)
-    scaled_weights = scale_model_weights(client_results, scaling_factor)
-    average_weight = sum_scaled_weights(scaled_weights)
-    return average_weight
+def aggregate_state_dicts(scaled_state_dicts):
+    aggregated_state_dict = {}
+    for key in scaled_state_dicts[0]:  # Initialize keys from first client
+        stacked_tensors = torch.stack([client_dict[key] for client_dict in scaled_state_dicts])
+        aggregated_state_dict[key] = stacked_tensors.sum(dim=0)
+    return aggregated_state_dict
 
-def aggregate_model_weights_v2(client_results):
-    pass
+def federated_averaging(client_results):
+    # Calculate the scaling factor for each client
+    scaling_factor = weight_scaling_factor(client_results)
+
+    # Scale each client's state_dict by its scaling factor
+    scaled_state_dicts = []
+    for client in client_results:
+        state_dict = client_results[client][0]
+        scaled_state_dict = scale_model_state_dict(state_dict, scaling_factor[client])
+        scaled_state_dicts.append(scaled_state_dict)
+
+    # Average the scaled state_dicts
+    aggregated_state_dict = aggregate_state_dicts(scaled_state_dicts)
+    return aggregated_state_dict
+
+def federated_averaging_v2(client_results):
+    # Initialize an empty state dict to hold the averaged weights
+    aggregated_state_dict = {}
+
+    # Get the state dicts from the first client to initialize the keys
+    first_client_key = next(iter(client_results))
+    aggregated_state_dict = {key: torch.zeros_like(client_results[first_client_key][key]) for key in client_results[first_client_key]}
+
+    # Sum the weights from all clients
+    for client_name, state_dict in client_results.items():
+        for key in state_dict:
+            aggregated_state_dict[key] += state_dict[key]
+
+    # Average the weights by dividing by the number of clients
+    num_clients = len(client_results)
+    for key in aggregated_state_dict:
+        aggregated_state_dict[key] /= num_clients
+
+    return aggregated_state_dict
 
 def main():
     dataSplitting = DataSplitting(data_folder, os.path.join(data_folder, 'data_split.json'))
-    dataSplitting.create_clients(unique_data=True)
-    dataSplitting._save_client_data_to_file()
-    dataSplitting.generate_report()
-
-    
+    dataSplitting.load_report(os.path.join(data_folder, 'data_split_report.json'))
+    # dataSplitting = get_data_distribution(dataSplitting)
     clients_name = dataSplitting.get_clients_names()
 
     # load and transform data
@@ -213,29 +236,68 @@ def main():
     for client_name in clients_name:
         clients[client_name] = transform_data(dataSplitting.get_client_data(client_name))
     # server do it 
+    # server do it
     testData = transform_data(testset)
     testDL = DataLoader(testData, batch_size=batch_size)
-        
-    comms_round = 5
-    global_model = CIFAR10()
-    global_model.set_weights(global_model.get_weights())
+
+    global_config = {
+        'inputShape': 3 * 32 * 32,
+        'outputShape': 10,
+        'state_dict': None
+    }
+    comms_round = 20
+    global_model = CIFAR10(global_config['inputShape'], global_config['outputShape'])
+
+    best_loss = float('inf')
+    best_model_state = global_model.state_dict()
+    patience = 0  # Number of rounds to wait for an improvement in accuracy
+    max_patience = 2  # Set the maximum number of rounds for early stopping
+
+    # Lists to save data for reporting
+    losses = []
+    accuracies = []
 
     for comm_round in range(comms_round):
         print(f"---Starting round {comm_round}---")
-        global_weights = global_model.get_weights()
+        global_state_dict = global_model.state_dict()
+        global_config['state_dict'] = global_state_dict
         client_results = {}
-        
+
         for client_name in clients_name:
             print(f"\tTraining {client_name}")
             client_data = clients[client_name]
-            weights, dataLen = train_local_model(client_data)
-            client_results[client_name] = (weights, dataLen)
+            state_dict, dataLen = train_local_model(client_data, global_config)
+            client_results[client_name] = (state_dict, dataLen)
             print(f"Client {client_name} has trained their model with {dataLen} data points.")
-        
-        # average the weights
-        aggregated_weights = aggregate_model_weights(client_results)
-        global_model.set_weights(aggregated_weights)
+
+        aggregated_state_dict = federated_averaging(client_results)
+        global_model.load_state_dict(aggregated_state_dict)
         print(f"Round {comm_round} has completed.")
-        evaluate(global_model, lossFn, testDL, metric=accuracy)
+
+        # Evaluate the global model
+        loss, _, acc = evaluate(global_model, lossFn, testDL, metric=accuracy)
+        losses.append(loss)
+        accuracies.append(acc)
+        print(f"Test loss: {loss}, Test accuracy: {acc}")
+
+        # Save the best model based on the lowest loss
+        if loss < best_loss:
+            best_loss = loss
+            best_model_state = global_model.state_dict()
+            patience = 0  # Reset patience if we find a new best model
+            print(f"New best model found with loss: {best_loss}")
+        else:
+            patience += 1  # Increment patience if no improvement
+
+        # Early stopping if accuracy does not increase
+        if patience >= max_patience:
+            print("Early stopping: no improvement in accuracy.")
+            break
+
+        # Save the best model state after training
+        global_model.load_state_dict(best_model_state)
+        global_model.save(os.path.join(model_folder, f'global_model_lost_{best_loss}.pth'))
+        print(f"Model saved with loss: {best_loss}")
+        print("Training completed.")
     
 main()
